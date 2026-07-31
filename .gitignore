@@ -1,0 +1,12 @@
+# 项目记忆与本地数据（含个人偏好，请勿提交）
+.workbuddy/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 临时/敏感探针文件（曾含真实 GitHub cookie，务必忽略）
+_cookie.txt
+_probe*.py
+_git_prep.txt
+_del*.py

@@ -1,34 +1,44 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AgentRouter 自动签到脚本 (青龙面板 / 任意 Python3 环境) — GitHub OAuth 版
+AgentRouter 自动签到脚本 (青龙面板 / 任意 Python3 环境)
 站点: https://agentrouter.org
 
-===== 原理 (已对线上 JS / 接口逐项实测确认) =====
-本站现已【只开放 GitHub / LinuxDO 两种 OAuth 登录】(服务端 /api/status 确认),
-没有邮箱密码登录。而"签到"= 每日登录一次:
-  1) GET  /api/oauth/state?mode=login        -> 拿到一次性 state(token, 带过期)
-  2) GET  https://github.com/login/oauth/authorize
-          ?client_id=<本站GitHub应用ID>&state=<state>&scope=user:email
-     用你自己的 GitHub 会话 cookie 访问; 因你此前已授权过该应用, GitHub 会 302
-     跳回本站回调并带上 code
+===== 原理 (已对线上接口逐项实测确认) =====
+本站"签到"= 每日完成一次登录。支持两种登录方式:
+
+方式 A [账号密码登录, 推荐/主路径, 实测最稳]:
+  向 POST /api/user/login 发送 {username: 邮箱, password: 密码}
+  -> 服务端下发 session cookie, 并在 data.checked_in=true 时发放当日额度
+  -> 登录响应 data 里直接带 quota(余额), 无需额外查询。
+  优点: 密码是固定的, 不像 GitHub 会话 cookie 会过期, 基本一劳永逸。
+
+方式 B [GitHub OAuth 登录, 兜底]:
+  1) GET  /api/oauth/state?mode=login        -> 拿到一次性 state
+  2) GET  https://github.com/login/oauth/authorize?client_id=<本站应用ID>&state=<state>&scope=user:email
+     用你的 GitHub 会话 cookie 访问; 因你此前已授权过该应用, GitHub 会 302 跳回本站回调并带 code
   3) GET  /api/oauth/github?code=<code>&state=<state>&mode=login
      -> 本站用 code 换 session, 并在 data.checked_in=true 时发放当日额度
-所以脚本每天走一遍上述 OAuth 流程即完成签到, 无需邮箱密码, 也无需浏览器。
+  缺点: GitHub 会话 cookie 会过期, 过期需重新复制。
+
+脚本优先使用方式 A; 若账号只配了 GitHub cookie 则自动走方式 B。
 
 ===== 配置方式 =====
-方式一 (单账号, 推荐先跑通):
-  AGENTROUTER_GITHUB_COOKIE  必填. 你 GitHub 账号的会话 cookie 整串。
-    获取: 浏览器登录 github.com -> F12 -> Network/Application -> Cookies,
-    复制全部 cookie (至少含 logged_in / dotcom_user / user_session / _octo 等)。
+单账号(账号密码, 推荐):
+  AGENTROUTER_EMAIL      必填. 你的注册邮箱, 例: zj773075692@gmail.com
+  AGENTROUTER_PASSWORD   必填. 该账号在 AgentRouter 的登录密码
 
-方式二 (多账号):
+单账号(GitHub OAuth, 兜底):
+  AGENTROUTER_GITHUB_COOKIE  必填. 你 GitHub 账号的会话 cookie 整串
+     (至少含 logged_in / dotcom_user / user_session / _octo)
+
+多账号(混用也行):
   AGENTROUTER_ACCOUNTS 选填. JSON 数组, 例:
   [
-    {"name":"账号甲","github_cookie":"logged_in=yes; user_session=xxx; ..."},
-    {"name":"账号乙","github_cookie":"logged_in=yes; user_session=yyy; ..."}
+    {"name":"账号甲","email":"a@x.com","password":"pwdA"},
+    {"name":"账号乙","github_cookie":"logged_in=yes; user_session=xxx; ..."}
   ]
-  设置了此项会自动忽略方式一的单账号变量.
+  设置了此项会自动忽略上面的单账号变量。
 
 ===== 青龙定时 =====
   新建任务 -> 命令: task agentrouter_checkin.py
@@ -36,13 +46,13 @@ AgentRouter 自动签到脚本 (青龙面板 / 任意 Python3 环境) — GitHub
   依赖: requests (青龙面板自带; 本地缺则 pip install requests)
 
 ===== 注意事项 =====
-  * GitHub 会话 cookie 会过期(数天~数十天), 过期后脚本会报"GitHub 未登录",
-    届时重新从浏览器复制一次即可。
-  * 若 GitHub 开启了两步验证且本次会话需重新验证, 自动化会失败并提示需手动处理。
-  * 备用域名 ps.air-outer.com 与本域名功能一致, 如需可改 BASE_URL。
-  * 若青龙环境无法直连 agentrouter.org / github.com(需翻墙), 设环境变量
-    AGENTROUTER_PROXY 指向可达代理, 例如 http://127.0.0.1:10808
-    (Docker 同机用 http://host.docker.internal:10808; http 不通试 socks5://)。
+  * 账号密码方式无需担心 cookie 过期, 最省心。
+  * GitHub cookie 方式会过期(数天~数十天), 过期后脚本报"GitHub 未登录", 重新复制即可。
+  * 备用域名 ps.air-outer.com 与本域名功能一致, 如需可改 AGENTROUTER_BASE_URL。
+  * 若青龙环境无法直连(常见于需翻墙/容器 IPv6 问题):
+    - 设 AGENTROUTER_FORCE_IPV4=1 强制走 IPv4 (海外服务器直连常见修复)
+    - 或设 AGENTROUTER_PROXY 指向可达代理, 例 http://127.0.0.1:10808
+      (Docker 同机用 http://host.docker.internal:10808; http 不通试 socks5://)
 """
 
 import os
@@ -61,9 +71,9 @@ except ImportError:
 
 # ---------- 基础配置 ----------
 BASE_URL = os.environ.get("AGENTROUTER_BASE_URL", "https://agentrouter.org").rstrip("/")
+LOGIN_PATH = "/api/user/login"
 STATE_PATH = "/api/oauth/state"
 GITHUB_EXCHANGE_PATH = "/api/oauth/github"
-SELF_PATH = "/api/user/self"
 GITHUB_AUTHZ = "https://github.com/login/oauth/authorize"
 TIMEOUT = 20
 # 已知 client_id (运行时也会从 /api/status 动态刷新, 这里作兜底)
@@ -73,12 +83,6 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
 
 # ---------- 代理(可选) ----------
-# 若青龙环境无法直接访问 agentrouter.org / github.com(常见于需翻墙的环境),
-# 设 AGENTROUTER_PROXY 指向一个可达的代理, 例如:
-#   本机原生运行:  http://127.0.0.1:10808
-#   Docker 同机:   http://host.docker.internal:10808
-#   若 http 不通:  socks5://127.0.0.1:10808
-# 不设置则沿用系统/环境自带的 HTTPS_PROXY。
 PROXY = os.environ.get("AGENTROUTER_PROXY", "").strip()
 PROXIES = {"http": PROXY, "https": PROXY} if PROXY else None
 
@@ -128,6 +132,15 @@ def parse_cookie(cookie_str):
     return cookies
 
 
+def extract_quota(payload):
+    """从登录/self 响应的 data 中提取余额字段。"""
+    if isinstance(payload, dict):
+        for k in ("quota", "remainder_quota", "balance"):
+            if k in payload:
+                return payload[k]
+    return None
+
+
 def get_github_client_id():
     try:
         r = requests.get(f"{BASE_URL}/api/status", timeout=TIMEOUT,
@@ -141,8 +154,61 @@ def get_github_client_id():
     return GITHUB_CLIENT_ID_FALLBACK
 
 
+# ===================== 方式 A: 账号密码登录 =====================
+def password_login(account):
+    name = account.get("name", "默认账号")
+    email = (account.get("email") or "").strip()
+    password = (account.get("password") or "").strip()
+    if not email or not password:
+        return _result(name, "fail", "未配置 email/password, 跳过", None, None)
+
+    log(f"====== 开始处理账号(账号密码登录): {name} ======")
+    site = requests.Session()
+    site.headers.update({
+        "User-Agent": UA,
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": f"{BASE_URL}/login",
+        "Origin": BASE_URL,
+    })
+    site.proxies = PROXIES
+
+    try:
+        r = site.post(f"{BASE_URL}{LOGIN_PATH}",
+                      json={"username": email, "password": password},
+                      timeout=TIMEOUT)
+    except Exception as e:
+        return _result(name, "fail", f"登录请求异常: {e}", None, None)
+
+    if "text/html" in r.headers.get("Content-Type", ""):
+        return _result(name, "fail", "登录接口返回 HTML(可能被 WAF 拦截或路径变化)", None, None)
+
+    try:
+        j = r.json()
+    except Exception:
+        return _result(name, "fail", f"登录响应非 JSON: {r.text[:120]}", None, None)
+
+    if not j.get("success"):
+        return _result(name, "fail",
+                       f"登录失败: {j.get('message') or r.text[:120]}", None, None)
+
+    data = j.get("data") or {}
+    checked_in = bool(data.get("checked_in"))
+    username = data.get("username") or data.get("display_name") or email
+    quota = extract_quota(data)
+
+    if checked_in:
+        status = "success"
+        msg = "签到成功，新增额度已到账" if "已签到" not in (j.get("message") or "") else j.get("message")
+    else:
+        status = "success"
+        msg = "登录成功，但 checked_in=false(可能今日额度已发或接口变化)"
+
+    return _result(name, status, msg, username, quota)
+
+
+# ===================== 方式 B: GitHub OAuth 登录 =====================
 def get_state():
-    """获取一次性 state token。失败返回 (None, 错误)"""
     try:
         r = requests.get(f"{BASE_URL}{STATE_PATH}?mode=login", timeout=TIMEOUT,
                          headers={"User-Agent": UA, "Referer": f"{BASE_URL}/login",
@@ -158,7 +224,6 @@ def get_state():
 
 
 def github_authorize(state, github_cookie, client_id):
-    """用 GitHub 会话 cookie 走授权, 返回 (code, error)。"""
     gh = requests.Session()
     gh.headers.update({
         "User-Agent": UA,
@@ -175,7 +240,6 @@ def github_authorize(state, github_cookie, client_id):
     except Exception as e:
         return None, f"访问 GitHub 授权页异常: {e}"
 
-    # 302/303 -> 检查 Location 是否带 code
     if r.status_code in (301, 302, 303, 307, 308):
         loc = r.headers.get("Location", "")
         if "code=" in loc:
@@ -183,17 +247,13 @@ def github_authorize(state, github_cookie, client_id):
             code = q.get("code")
             if code:
                 return code[0], None
-        # 跳回 github 登录/2fa -> 会话失效或未授权
         return None, "GitHub 未登录/需 2FA 或尚未授权本站应用(code 未返回)"
-    # 200 且是 HTML -> GitHub 要求手动点击"Authorize"或输入 2FA
     if "text/html" in r.headers.get("Content-Type", ""):
         return None, "GitHub 返回授权页面(需手动授权/2FA), 请先在浏览器用该 GitHub 账号完成一次本站授权"
-    # 其他
     return None, f"GitHub 授权页意外响应: HTTP {r.status_code}"
 
 
 def exchange(code, state):
-    """用 code+state 换本站 session。返回 (site_session, json, error)。"""
     site = requests.Session()
     site.headers.update({
         "User-Agent": UA,
@@ -213,41 +273,22 @@ def exchange(code, state):
         return None, None, f"换 session 异常: {e}"
 
 
-def get_self_quota(site_session):
-    try:
-        r = site_session.get(f"{BASE_URL}{SELF_PATH}", timeout=TIMEOUT)
-        if "text/html" in r.headers.get("Content-Type", ""):
-            return None
-        data = r.json()
-        payload = data.get("data") if isinstance(data, dict) else None
-        if isinstance(payload, dict):
-            for k in ("quota", "remainder_quota", "balance"):
-                if k in payload:
-                    return payload[k]
-    except Exception:
-        pass
-    return None
-
-
-def do_checkin(account, client_id):
+def github_oauth_checkin(account, client_id):
     name = account.get("name", "默认账号")
-    github_cookie = account.get("github_cookie", "").strip()
+    github_cookie = (account.get("github_cookie") or "").strip()
     if not github_cookie:
         return _result(name, "fail", "未配置 github_cookie, 跳过", None, None)
 
-    log(f"====== 开始处理账号: {name} ======")
+    log(f"====== 开始处理账号(GitHub OAuth): {name} ======")
 
-    # 1) state
     state, err = get_state()
     if err:
         return _result(name, "fail", f"获取 state 失败: {err}", None, None)
 
-    # 2) github authorize -> code
     code, err = github_authorize(state, github_cookie, client_id)
     if err:
         return _result(name, "fail", f"GitHub 授权失败: {err}", None, None)
 
-    # 3) exchange -> session + checkin result
     site_session, j, err = exchange(code, state)
     if err:
         return _result(name, "fail", f"换 session 失败: {err}", None, None)
@@ -258,15 +299,7 @@ def do_checkin(account, client_id):
     payload = j.get("data") or {}
     checked_in = bool(payload.get("checked_in"))
     username = payload.get("username") or payload.get("display_name") or ""
-
-    # 4) 确认额度
-    quota = None
-    for k in ("quota", "remainder_quota", "balance"):
-        if k in payload:
-            quota = payload[k]
-            break
-    if quota is None and site_session is not None:
-        quota = get_self_quota(site_session)
+    quota = extract_quota(payload)
 
     if checked_in:
         status = "success"
@@ -276,6 +309,20 @@ def do_checkin(account, client_id):
         msg = "登录成功，但 checked_in=false(可能今日额度已发或接口变化)"
 
     return _result(name, status, msg, username, quota)
+
+
+# ===================== 调度 =====================
+def do_checkin(account, client_id):
+    email = (account.get("email") or "").strip()
+    password = (account.get("password") or "").strip()
+    github_cookie = (account.get("github_cookie") or "").strip()
+    if email and password:
+        return password_login(account)
+    elif github_cookie:
+        return github_oauth_checkin(account, client_id)
+    else:
+        return _result(account.get("name", "默认账号"), "fail",
+                       "账号未配置 email/password 或 github_cookie", None, None)
 
 
 def _result(name, status, message, username, quota):
@@ -308,17 +355,25 @@ def collect_accounts():
         except Exception as e:
             log(f"AGENTROUTER_ACCOUNTS 解析失败: {e}, 回退到单账号")
 
+    email = os.environ.get("AGENTROUTER_EMAIL", "").strip()
+    password = os.environ.get("AGENTROUTER_PASSWORD", "").strip()
+    if email and password:
+        accounts.append({"name": "默认账号", "email": email, "password": password})
+        log("已读取单账号配置(账号密码登录)")
+        return accounts
+
     cookie = os.environ.get("AGENTROUTER_GITHUB_COOKIE", "").strip()
     if cookie:
         accounts.append({"name": "默认账号", "github_cookie": cookie})
-        log("已读取单账号配置")
-    else:
-        log("未检测到任何配置: 请设置 AGENTROUTER_GITHUB_COOKIE 或 AGENTROUTER_ACCOUNTS")
+        log("已读取单账号配置(GitHub OAuth)")
+        return accounts
+
+    log("未检测到任何配置: 请设置 AGENTROUTER_EMAIL+AGENTROUTER_PASSWORD 或 AGENTROUTER_GITHUB_COOKIE")
     return accounts
 
 
 def main():
-    log("AgentRouter 自动签到启动 (GitHub OAuth 登录即签到)")
+    log("AgentRouter 自动签到启动 (账号密码 / GitHub OAuth 登录即签到)")
     client_id = get_github_client_id()
     log(f"GitHub client_id: {client_id}")
 

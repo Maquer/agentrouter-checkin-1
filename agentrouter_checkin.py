@@ -48,6 +48,8 @@ AgentRouter 自动签到脚本 (青龙面板 / 任意 Python3 环境)
 ===== 注意事项 =====
   * 账号密码方式无需担心 cookie 过期, 最省心。
   * GitHub cookie 方式会过期(数天~数十天), 过期后脚本报"GitHub 未登录", 重新复制即可。
+  * 签到后默认做一次端到端核验: 读取 /api/log/self 个人日志, 确认存在 type=4、
+    内容含"签到成功"的当日记录, 才会报"日志已确认", 避免"登录成功但签到未真正触发"。
   * 备用域名 ps.air-outer.com 与本域名功能一致, 如需可改 AGENTROUTER_BASE_URL。
   * 若青龙环境无法直连(常见于需翻墙/容器 IPv6 问题):
     - 设 AGENTROUTER_FORCE_IPV4=1 强制走 IPv4 (海外服务器直连常见修复)
@@ -75,6 +77,10 @@ LOGIN_PATH = "/api/user/login"
 STATE_PATH = "/api/oauth/state"
 GITHUB_EXCHANGE_PATH = "/api/oauth/github"
 GITHUB_AUTHZ = "https://github.com/login/oauth/authorize"
+# 用户个人日志(控制台"使用日志"页), 需带 New-API-User: <数字 uid> 请求头
+SELF_LOG_PATH = "/api/log/self/"
+SELF_LOG_HEADER = "New-API-User"
+CHECKIN_LOG_TYPE = 4  # 每日签到日志的 type 字段值
 TIMEOUT = 20
 # 已知 client_id (运行时也会从 /api/status 动态刷新, 这里作兜底)
 GITHUB_CLIENT_ID_FALLBACK = "Ov23lidtiR4LeVZvVRNL"
@@ -196,10 +202,16 @@ def password_login(account):
     checked_in = bool(data.get("checked_in"))
     username = data.get("username") or data.get("display_name") or email
     quota = extract_quota(data)
+    uid = data.get("id")
 
     if checked_in:
-        status = "success"
-        msg = "签到成功，新增额度已到账" if "已签到" not in (j.get("message") or "") else j.get("message")
+        level, vdetail, _, _ = verify_checkin(site, uid)
+        if level in ("new", "today"):
+            status = "success"
+            msg = f"签到成功，日志已确认（{vdetail}）"
+        else:
+            status = "success"
+            msg = f"登录成功且服务端返回已签到，但日志未确认: {vdetail}"
     else:
         status = "success"
         msg = "登录成功，但 checked_in=false(可能今日额度已发或接口变化)"
@@ -300,15 +312,78 @@ def github_oauth_checkin(account, client_id):
     checked_in = bool(payload.get("checked_in"))
     username = payload.get("username") or payload.get("display_name") or ""
     quota = extract_quota(payload)
+    uid = payload.get("id")
 
     if checked_in:
-        status = "success"
-        msg = "签到成功，新增额度已到账" if "已签到" not in (j.get("message") or "") else j.get("message")
+        level, vdetail, _, _ = verify_checkin(site_session, uid)
+        if level in ("new", "today"):
+            status = "success"
+            msg = f"签到成功，日志已确认（{vdetail}）"
+        else:
+            status = "success"
+            msg = f"登录成功且服务端返回已签到，但日志未确认: {vdetail}"
     else:
         status = "success"
         msg = "登录成功，但 checked_in=false(可能今日额度已发或接口变化)"
 
     return _result(name, status, msg, username, quota)
+
+
+# ===================== 签到日志核验 =====================
+def verify_checkin(session, uid, slack_new=300, window_days=1):
+    """登录成功后调用: 查询 /api/log/self 确认是否真的产生了"签到成功"日志。
+
+    端到端验证: 服务端登录返回 checked_in=true 只说明"当日签到已计入",
+    但 /console/log 里会落一条 type=4、内容含"签到成功"的日志。比对这条日志
+    可以排除"登录成功但签到未真正触发"的边界情况。
+
+    返回 (level, detail, ts, content):
+      level:
+        "new"   本次运行刚生成了签到日志(created_at 在 slack_new 秒内)
+        "today" 近 window_days 天内有签到日志(多半是今日更早时已完成签到)
+        "none"  找不到任何签到日志 / 日志过旧
+        "error" 日志接口异常(此时不应影响登录结论)
+    """
+    if not uid:
+        return "error", "缺少 uid, 跳过日志核验", None, None
+    try:
+        r = session.get(f"{BASE_URL}{SELF_LOG_PATH}",
+                        params={"p": 1, "page_size": 20},
+                        headers={SELF_LOG_HEADER: str(uid)},
+                        timeout=TIMEOUT)
+        if r.status_code != 200 or "text/html" in r.headers.get("Content-Type", ""):
+            return "error", f"日志接口返回 HTTP {r.status_code}", None, None
+        items = (r.json().get("data") or {}).get("items") or []
+    except Exception as e:
+        return "error", f"日志查询异常: {e}", None, None
+
+    now = int(time.time())
+    newest_ts, newest_content = None, None
+    for it in items:
+        content = it.get("content") or ""
+        if ("签到成功" in content) or (it.get("type") == CHECKIN_LOG_TYPE):
+            ts = it.get("created_at")
+            if isinstance(ts, (int, float)) and (newest_ts is None or ts > newest_ts):
+                newest_ts, newest_content = ts, content
+
+    if newest_ts is None:
+        return "none", "日志中未找到任何签到记录", None, None
+
+    ago = now - newest_ts
+    if ago < 60:
+        ago_str = f"{ago} 秒前"
+    elif ago < 3600:
+        ago_str = f"{int(ago / 60)} 分钟前"
+    elif ago < 86400:
+        ago_str = f"{int(ago / 3600)} 小时前"
+    else:
+        ago_str = f"{int(ago / 86400)} 天前"
+
+    if newest_ts >= now - slack_new:
+        return "new", f"本次运行已生成签到日志（{ago_str}）", newest_ts, newest_content
+    if newest_ts >= now - window_days * 86400:
+        return "today", f"近 {window_days} 天内有签到记录（{ago_str}），本次未新增", newest_ts, newest_content
+    return "none", f"最近一条签到日志较旧（{ago_str}）", newest_ts, newest_content
 
 
 # ===================== 调度 =====================

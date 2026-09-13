@@ -1,9 +1,10 @@
 name: AgentRouter Daily Checkin
 
 on:
-  schedule:
-    # 09:00 Asia/Shanghai = 01:00 UTC；服务端按天去重，一天一次即可
-    - cron: "0 1 * * *"
+  # 暂停 cron：站点 WAF 屏蔽 GitHub Actions runner IP（Azure US），手动验证 OK 再启用
+  # 恢复时取消注释即可，同时删除下面注释的 `# 0 1 * * *` 注释块
+  # schedule:
+  #   - cron: "0 1 * * *"
   workflow_dispatch:
   repository_dispatch:
 
@@ -38,11 +39,22 @@ jobs:
 
       - name: Run checkin
         id: run
+        shell: bash
         run: |
-          python agentrouter_checkin.py 2>&1 | tee checkin.log
+          set -o pipefail
+          python3 agentrouter_checkin.py 2>&1 | tee checkin.log
           # 从日志抓额度并回写 summary（不打印密码）
           QUOTA=$(grep -oE '额度: [0-9]+' checkin.log | tail -1 | awk '{print $2}')
           echo "quota=$QUOTA" >> "$GITHUB_OUTPUT"
+          # 硬门禁：脚本 exit 0 不等于签到成功，必须看日志内容
+          if grep -q "登录接口返回 HTML" checkin.log; then
+            echo "::error::WAF blocked the runner IP (Azure US). Switch to minis-scheduled or self-hosted runner."
+            exit 1
+          fi
+          if grep -q "❌ 失败" checkin.log; then
+            echo "::error::Checkin failed. See checkin.log for details."
+            exit 1
+          fi
 
       - name: Job summary
         if: always()

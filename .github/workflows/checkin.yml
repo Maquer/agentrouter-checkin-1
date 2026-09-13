@@ -1,0 +1,65 @@
+name: AgentRouter Daily Checkin
+
+on:
+  schedule:
+    # 09:00 Asia/Shanghai = 01:00 UTC；服务端按天去重，一天一次即可
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+  repository_dispatch:
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      AGENTROUTER_ACCOUNT: ${{ secrets.AGENTROUTER_ACCOUNT }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Guardrail - credentials must be set
+        run: |
+          if [ -z "$AGENTROUTER_ACCOUNT" ]; then
+            echo "::error::AGENTROUTER_ACCOUNT secret is not set. Add it under Settings → Secrets and variables → Actions → Repository secrets."
+            exit 1
+          fi
+          case "$AGENTROUTER_ACCOUNT" in
+            *#*) echo "::notice::Credential format OK (邮箱#密码)" ;;
+            *)   echo "::error::AGENTROUTER_ACCOUNT must be '邮箱#密码' format" ; exit 1 ;;
+          esac
+
+      - name: Run checkin
+        id: run
+        run: |
+          python agentrouter_checkin.py 2>&1 | tee checkin.log
+          # 从日志抓额度并回写 summary（不打印密码）
+          QUOTA=$(grep -oE '额度: [0-9]+' checkin.log | tail -1 | awk '{print $2}')
+          echo "quota=$QUOTA" >> "$GITHUB_OUTPUT"
+
+      - name: Job summary
+        if: always()
+        run: |
+          echo "## AgentRouter Checkin - ${{ github.run_attempt }}th attempt" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.run.outcome }}" = "success" ]; then
+            echo "- Status: ✅ success" >> $GITHUB_STEP_SUMMARY
+            echo "- Quota reported: ${{ steps.run.outputs.quota }}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- Status: ❌ failed" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '<details><summary>Full log</summary>' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat checkin.log 2>/dev/null || echo '(no log captured)' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo '</details>' >> $GITHUB_STEP_SUMMARY
